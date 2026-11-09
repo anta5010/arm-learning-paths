@@ -81,7 +81,7 @@ You'll be asked for a passphrase for the Secure Boot signing certificates. Remem
 ./run-user-context-service.sh
 ```
 
-## Launch Realm with StandaloneMM in plane0 and Linux in Plane1
+## Launch Realm with StandaloneMM in Plane0 and Linux in Plane1
 
 With the User Context service running in the User Context terminal, open the FVP terminal.
 
@@ -116,6 +116,11 @@ Change directory to `/cca` and use `lkvm-planes` to launch a guest Linux in a Re
 cd /cca
 ./lkvm-planes run --realm -m 1G -c 8 --realm-layout plane-map.dtb \
   --irqchip=gicv3-its --nodefaults --force-pci --disk guest-disk.img
+```
+
+With this command you start a realm where EDK2 StandaloneMM is launched in Plane0 and Linux kernel is booted by EDK2 UEFI in Plane1.
+StandaloneMM includes Secure Variable Storage, (BootSync ???) and vTPM components.
+
 
 After running the command, you'll see the Realm boot.
 After the Realm boots, log in using the root again as the username:
@@ -124,14 +129,6 @@ After the Realm boots, log in using the root again as the username:
 Welcome to the CCA realm
 realm login: root
 (realm) #
-```
-
-Use the `efivar` utility to check the Secure Boot EFI variable. A value of `0` confirms that Secure Boot is not enabled:
-
-```bash { output_lines="3" }
-mount -t efivarfs efivarfs /sys/firmware/efi/efivars
-efivar -p -d -n {global}-SecureBoot
-0
 ```
 
 You can check values of TPM PCR registers:
@@ -171,12 +168,131 @@ Stop the Realm:
 poweroff
 ```
 
+## Encrypt the root file system and seal the passphrase with TPM PCR7
+
+You can use vTPM with data provisioned by Arm CCA BootSync to provide access to encrypted file systems.
+You'll now encrypt the root file system, seal the passphrase with TPM PCR7 and test how it is used to unlock the disk during boot.
+
+### Encrypt the root partition
+
+In the FVP terminal, use the `encrypt_rootfs.sh` script to encrypt the root partition in the Realm disk image and add an `initrd` image to the kernel parameters.
+
+You'll be asked for a passphrase to encrypt the root partition. Use a memorable test passphrase and keep it available,
+because you'll later will be asked for it (or write the same value into `ARMCCA01_SEC.dat` for BootSync to release ???).
+
+You can use a maximum of 512 characters of uppercase or lowercase letters, numbers, and symbols.
+Ignore the warning message because you're using small partitions.
+
+```bash { output_lines="2-11" }
+encrypt_rootfs.sh
+Resizing root file system to accommodate minimal LUKS2 header
+resize2fs 1.47.3 (8-Jul-2025)
+Resizing the filesystem on /dev/loop0p2 to 260096 (1k) blocks.
+The filesystem on /dev/loop0p2 is now 260096 (1k) blocks long.
+
+tune2fs 1.47.3 (8-Jul-2025)
+Encrypting root partition
+Enter passphrase for LUKS2-temp-4684d923-d8b7-4371-8bb2-f8667bfb0498.new:
+WARNING: keyslots area (1015808 bytes) is very small, available LUKS2 keyslot count is very limited.
+Enable Initrd image
+```
+
+
+### Seal the passphrase with TPM PCR7
+
+At this step you would seal the passphrase and store it in vTPM persisent storage.
+Later the data can be used to unlock encrypted file system.
+
+In the FVP terminal, relaunch the Realm.
+
+```bash
+cd /cca
+./lkvm-planes run --realm -m 1G -c 8 --realm-layout plane-map.dtb \
+  --irqchip=gicv3-its --nodefaults --force-pci --disk guest-disk.img
+```
+
+In the Realm boot log, you can see that the init script seals the passphrase.
+You will be asked for it (if it's not avaliable as a CoCo secrete provisioned by Arm CCA BootSync ???):
+
+``` output
+[   40.109947] Run /init as init process
+/dev/vda2 is a LUKS paritition.
+NVRAM handle 0x81000001 doesn't exist.
+Attempting to seal the LUKS passphrase with a PCR7 policy.
+CoCo secret doesn't exist.
+Please enter LUKS passphrase:
+Create the primary parent context
+Generate the PCR7 policy file
+Create the sealed key object using the policy file
+Load the sealed key into volatile memory
+Persist it to the hardware NVRAM handle
+The LUKS passphrase has been sealed with a PCR7 policy. Rebooting...
+[   76.556805] reboot: Power down
+  Info: KVM session ended normally.
+```
+
+The Realm will be stopped after the sealing the passphrase and storing it into vTMP NVRAM.
+While the Realm being stopped Arm CCA BootSync will provision the vTPM data to the User Context Service.
+
+### Unlock encrypted file system with the sealed passphrase
+
+Now, when we have vTPM data with the sealed passphrase avaliable we can relaunch the Realm and see how the vTPM is used to unlock encrypted file system.
+During Plane1 boot UEFI would execute CCA attestation and if successful vTPM will be provisioned with the data including the sealed passphrase.
+It later will be unsealed using PCR7 and used to unlock encrypted file system. The unsealing would be successfull only if PCR7 value would be the same
+as it was when the passphrase was sealed. (TO-DO We can also add a falied step. For example when SecureBoot is not set ???)
+
+In the FVP terminal, relaunch the Realm.
+
+```bash
+cd /cca
+./lkvm-planes run --realm -m 1G -c 8 --realm-layout plane-map.dtb \
+  --irqchip=gicv3-its --nodefaults --force-pci --disk guest-disk.img
+```
+
+In the Realm boot log, you can see that the init script unseals the passphrase and unlocks the encrypted file system:
+
+``` output
+[   40.109947] Run /init as init process
+/dev/vda2 is a LUKS paritition.
+NVRAM handle 0x81000001 found.
+Attempting to unseal LUKS passphrase and unlock /dev/vda2
+TPM NVRAM hardware unlock successful, switching root
+```
+
+After the Realm boots, log in using `root` as the username:
+
+```output
+Welcome to the CCA realm
+realm login: root
+(realm) #
+```
+
+Check that the unlocked encrypted partition `/dev/mapper/cryptroot` is mounted as root:
+
+```bash { output_lines="2-9" }
+df -h
+Filesystem                Size      Used Available Use% Mounted on
+devtmpfs                174.4M         0    174.4M   0% /dev
+/dev/mapper/cryptroot
+                        227.9M     93.0M    118.2M  44% /
+tmpfs                   194.8M         0    194.8M   0% /dev/shm
+tmpfs                   194.8M     40.0K    194.8M   0% /tmp
+tmpfs                   194.8M     32.0K    194.8M   0% /run
+cgroup                  194.8M         0    194.8M   0% /sys/fs/cgroup
+```
+
+Stop the Realm:
+
+```bash
+poweroff
+```
+
 Stop the FVP:
 
 ```bash
 poweroff
 ```
 
-## What you've accomplished 
+## What you've accomplished
 
 TO-DO
